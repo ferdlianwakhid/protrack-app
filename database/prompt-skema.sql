@@ -1,262 +1,452 @@
 -- =====================================================================
--- PROMPT DALAM BENTUK FILE SQL
+--  PROMPT: MINTA SKEMA DATABASE SISTEM DETEKSI KEHAMILAN DINI
+--  Metode: Fuzzy Tsukamoto   |   Target: MySQL 8 / MariaDB
+-- =====================================================================
 --
--- Cara pakai, pilih salah satu:
---   A. Tempel seluruh isi file ini ke Claude/ChatGPT, lalu tulis satu baris:
---      "Lengkapi file ini menjadi skema SQL yang bisa dijalankan."
---   B. Pakai sebagai lembar kerja: isi sendiri bagian bertanda TODO.
+--  CARA PAKAI
+--    Tempel seluruh isi file ini ke Claude atau ChatGPT, lalu kirim.
+--    Tidak perlu menambah kalimat apa pun; perintahnya sudah ada di
+--    Bagian 8 paling bawah.
 --
--- Semua yang dibutuhkan sudah ada di komentar di bawah. Jangan menambah
--- tabel di luar 8 tabel yang disebutkan.
+--  ISI FILE INI
+--    Bagian 1  Gambaran sistem
+--    Bagian 2  Daftar pertanyaan yang diisi pengguna
+--    Bagian 3  Tujuh tabel yang diminta, kolom per kolom
+--    Bagian 4  Cara menghitung dengan Tsukamoto
+--    Bagian 5  Data awal yang harus ikut dimasukkan
+--    Bagian 6  Cara membangkitkan 162 aturan
+--    Bagian 7  Angka hasil yang benar, untuk memeriksa pekerjaan
+--    Bagian 8  Perintah dan bentuk jawaban yang diminta
+--
 -- =====================================================================
 
 
 -- =====================================================================
--- BAGIAN 1. APA YANG DIBANGUN
+--  BAGIAN 1 - GAMBARAN SISTEM
 -- =====================================================================
--- Aplikasi untuk memperkirakan kemungkinan kehamilan dini, memakai metode
--- Fuzzy Tsukamoto. Pengguna mengisi 7 pertanyaan, sistem menghitung, lalu
--- keluar satu skor 0-100 beserta sarannya.
 --
--- Tujuh pertanyaannya:
---   4 gejala  : telat haid (hari), mual (kali/hari), nyeri payudara (skala
---               0-10), frekuensi berkemih (kali/hari)
---   3 riwayat : hubungan seksual terakhir berapa hari lalu, pemakaian
---               pengaman (selalu/kadang/tidak), ejakulasi di dalam
---               (tidak/tidak yakin/ya)
+--  Aplikasi web untuk membantu seseorang memperkirakan kemungkinan dirinya
+--  hamil pada tahap awal. Pengguna menjawab beberapa pertanyaan, sistem
+--  menghitung, lalu menampilkan satu skor 0-100 beserta sarannya.
 --
--- Target database: MySQL 8.0.16+ atau MariaDB 10.5+, InnoDB, utf8mb4.
--- Nama tabel dan kolom: bahasa Indonesia, huruf kecil, garis bawah.
-
-
--- =====================================================================
--- BAGIAN 2. ATURAN YANG TIDAK BOLEH DILANGGAR
--- =====================================================================
--- 1. GERBANG 7 HARI. Kalau hubungan terakhir kurang dari 7 hari lalu,
---    TIDAK ADA skor sama sekali. Yang keluar hanya status "belum bisa
---    dinilai" dan tanggal uji paling awal (tanggal hubungan + 14 hari).
---    Jadi tabel penilaian harus boleh menyimpan baris tanpa skor, dan itu
---    harus dijaga CHECK constraint, bukan hanya oleh program.
---    Kondisi ini TIDAK BOLEH dijadikan aturan fuzzy: setiap aturan fuzzy
---    selalu menghasilkan angka, dan angka rendah akan dibaca pengguna
---    sebagai "aman" padahal yang benar "belum bisa diketahui".
+--  Ada dua jenis pemakai:
 --
--- 2. Jawaban "belum pernah berhubungan" menutup jalur kehamilan, statusnya
---    sendiri, juga tanpa skor.
+--    user   - mengisi kuesioner dan melihat hasil serta riwayatnya sendiri
+--    admin  - mengelola batas tingkatan dan daftar aturan, serta melihat
+--             seluruh data penilaian
 --
--- 3. Pengaman tidak pernah menihilkan skor. Lihat tabel paparan di bawah.
+--  Keduanya disimpan di satu tabel yang sama, dibedakan oleh kolom peran.
 --
--- 4. Himpunan keluaran WAJIB monoton. Lihat Bagian 4.
+--  Hasil sistem ini adalah indikasi awal, BUKAN diagnosis. Setiap tampilan
+--  hasil wajib memuat kalimat peringatan itu, dan kalimatnya disimpan di
+--  database, bukan ditulis di kode program.
 
 
 -- =====================================================================
--- BAGIAN 3. DELAPAN TABEL YANG DIMINTA
+--  BAGIAN 2 - PERTANYAAN YANG DIISI PENGGUNA
 -- =====================================================================
--- Kelompok pengetahuan bidan (jarang berubah, sudah terisi sejak awal):
 --
---   pengguna          akun; kolom peran membedakan 'pengguna' dan 'bidan'
---   variabel          5 baris: 4 gejala (jenis input) + 1 hasil (output),
---                     berisi satuan dan rentang nilainya
---   himpunan          15 baris. Untuk variabel input pakai kolom a,b,c,d
---                     (trapesium). Untuk variabel output pakai kolom
---                     bentuk ('naik'/'turun') + batas_bawah + batas_atas.
---                     Tambahkan kolom bobot, lihat Bagian 5.
---   paparan           9 baris: kombinasi pengaman x ejakulasi di dalam,
---                     hasilnya satu tingkat paparan
---   aturan            243 baris. Lima kolom syarat berjajar dalam satu
---                     baris (himpunan haid, mual, nyeri, berkemih, dan
---                     tingkat paparan) + satu kolom kesimpulan.
---                     Kelima kolom syarat itu harus UNIQUE bersama-sama
---                     supaya aturan kembar tidak bisa masuk dua kali.
---   kategori_hasil    ambang skor tiap kategori + judul + saran +
---                     kalimat peringatan "hasil bukan diagnosis"
+--  A. Tiga pertanyaan riwayat
 --
--- Kelompok pemakaian (bertambah terus):
+--     1. "Apakah pernah berhubungan seksual?"
+--        Pilihan: ya / tidak                    -> simpan sebagai ENUM
 --
---   penilaian         1 baris per pengisian kuesioner: 7 jawaban mentah,
---                     tingkat paparan hasil lookup, status gerbang,
---                     skor_mentah (sebelum dibulatkan), skor, kategori
---   penilaian_aturan  jejak hitung: 1 baris per aturan yang aktif, berisi
---                     alfa dan z. Jumlah aturan aktif beda tiap penilaian,
---                     jadi harus baris, tidak boleh jadi kolom.
+--     2. "Berapa hari yang lalu terakhir berhubungan seksual?"
+--        Jawaban berupa angka, satuan hari      -> simpan sebagai angka
+--        Hanya ditanyakan kalau pertanyaan 1 dijawab "ya".
 --
--- Tidak perlu tabel versi pengetahuan, audit log, atau evaluasi akurasi.
-
-
--- =====================================================================
--- BAGIAN 4. CARA HITUNG TSUKAMOTO
---           Ini bagian yang paling sering tertukar dengan Mamdani.
--- =====================================================================
--- Langkah hitungnya:
---   a. Fuzzifikasi: tiap jawaban gejala diubah jadi derajat keanggotaan
---      (0 sampai 1) pada tiap himpunan. Satu jawaban boleh cocok dengan
---      dua himpunan sekaligus.
---   b. Tingkat paparan masuk sebagai syarat kelima dengan derajat = 1,
---      karena nilainya tegas, bukan fuzzy.
---   c. Untuk tiap aturan yang aktif, alfa = nilai TERKECIL dari kelima
---      syaratnya (operator AND = MIN).
---   d. RUMUS BALIK. Tiap aturan menghasilkan satu nilai z sendiri, dihitung
---      dari alfa-nya dengan membalik rumus himpunan keluaran:
---          bentuk 'naik'  ->  z = batas_bawah + (batas_atas-batas_bawah)*alfa
---          bentuk 'turun' ->  z = batas_atas  - (batas_atas-batas_bawah)*alfa
---   e. Skor = jumlah(alfa * z) / jumlah(alfa), lalu dibulatkan setengah ke
---      atas (72,5 menjadi 73).
+--     3. "Apakah memakai pengaman atau kontrasepsi?"
+--        Pilihan: ya / tidak                    -> simpan sebagai ENUM
+--        Hanya ditanyakan kalau pertanyaan 1 dijawab "ya".
 --
--- TIDAK ADA tahap komposisi/agregasi MAX seperti pada Mamdani.
+--  B. Empat pertanyaan gejala, semuanya berupa angka
 --
--- Himpunan keluaran harus monoton supaya satu alfa memberi tepat satu z.
--- Himpunan segitiga tidak boleh dipakai di sini. Pakai tiga ini:
+--     4. Sudah berapa hari telat haid?              0 - 60  hari
+--     5. Berapa kali mual atau muntah per hari?     0 - 10  kali
+--     6. Seberapa nyeri payudara?                   0 - 10  skala
+--     7. Berapa kali buang air kecil per hari?      4 - 20  kali
 --
---     kode     bentuk   batas_bawah   batas_atas   rumus balik
---     ------   ------   -----------   ----------   ---------------------
---     RENDAH   turun          0            40      z = 40 - 40*alfa
---     SEDANG   naik          30            70      z = 30 + 40*alfa
---     TINGGI   naik          60           100      z = 60 + 40*alfa
+--  C. Dua keadaan yang membuat sistem TIDAK mengeluarkan skor
 --
--- Karena z berubah mengikuti alfa, nilai z WAJIB ikut disimpan di tabel
--- penilaian_aturan. Mengandalkan kolom batas di tabel himpunan saja membuat
--- hasil lama tidak bisa diperiksa ulang.
+--     Ini aturan terpenting di seluruh sistem, mohon jangan dilewati.
+--
+--     - Pertanyaan 1 dijawab "tidak"
+--       Tanpa hubungan seksual, kehamilan tidak mungkin terjadi. Keluhan
+--       diarahkan ke informasi gangguan haid, bukan ke skor kehamilan.
+--
+--     - Pertanyaan 2 dijawab kurang dari 7 hari
+--       Sedini itu kehamilan belum bisa terdeteksi oleh gejala apa pun.
+--       Sistem menampilkan "belum bisa dinilai" beserta tanggal paling awal
+--       untuk tes, yaitu tanggal hubungan ditambah 14 hari.
+--
+--     Pada kedua keadaan ini kolom skor dan kategori HARUS kosong. Jangan
+--     mengisinya dengan angka kecil, karena pengguna akan membacanya sebagai
+--     "aman" padahal yang benar adalah "belum bisa diketahui". Paksakan ini
+--     dengan CHECK constraint, jangan hanya mengandalkan program.
 
 
 -- =====================================================================
--- BAGIAN 5. DATA AWAL YANG HARUS IKUT DI-INSERT
+--  BAGIAN 3 - TUJUH TABEL YANG DIMINTA
 -- =====================================================================
--- Himpunan variabel input, dengan titik trapesium [a,b,c,d] dan bobotnya.
--- Bobot HANYA dipakai sekali untuk menyusun aturan, tidak dipakai saat
--- menghitung. Telat haid diberi bobot ganda karena satu-satunya gejala yang
--- bisa berdiri sendiri sebagai indikasi.
 --
---   TELAT HAID (hari, 0-60)
---     TEPAT_WAKTU  [ 0,  0,  5, 12]  bobot 0
---     AGAK_TELAT   [ 7, 14, 21, 28]  bobot 2
---     TELAT        [21, 35, 60, 60]  bobot 4
---   MUAL (kali/hari, 0-10)
---     RINGAN       [ 0,  0,  1,  3]  bobot 0
---     SEDANG       [ 2,  4,  5,  7]  bobot 1
---     BERAT        [ 5,  7, 10, 10]  bobot 2
---   NYERI PAYUDARA (skala 0-10)
---     RINGAN       [ 0,  0,  2,  5]  bobot 0
---     SEDANG       [ 3,  5,  6,  8]  bobot 1
---     BERAT        [ 6,  8, 10, 10]  bobot 2
---   FREKUENSI BERKEMIH (kali/hari, 4-20)
---     NORMAL       [ 4,  4,  6,  9]  bobot 0
---     MENINGKAT    [ 7, 10, 12, 15]  bobot 1
---     SERING       [12, 15, 20, 20]  bobot 2
+--  Buat tepat tujuh tabel ini, tidak lebih. Nama kolom boleh disesuaikan
+--  sedikit, tapi jangan menggabungkan atau memecah tabelnya.
 --
--- Tabel paparan, 9 baris. Dua sel bertanda (!) sengaja tidak rendah:
--- kontrasepsi punya angka kegagalan, dan cairan pra-ejakulasi tetap berisiko.
 --
---   pengaman \ ejakulasi di dalam | tidak      | tidak_yakin | ya
---   ------------------------------+------------+-------------+-----------
---   selalu                        | rendah     | rendah      | sedang (!)
---   kadang                        | rendah     | sedang      | tinggi
---   tidak                         | sedang (!) | tinggi      | tinggi
+--  (1) users                                        2 baris data awal
+--      ----------------------------------------------------------------
+--      id, nama, email (unik), kata_sandi (hash),
+--      peran ENUM('user','admin') default 'user',
+--      dibuat_pada
 --
--- Ambang kategori: rendah 0-39, sedang 40-70, tinggi 71-100.
--- Tambahkan juga dua baris tanpa ambang untuk status "belum bisa dinilai"
--- dan "tanpa riwayat hubungan", supaya semua teks yang dilihat pengguna
--- ada di satu tabel.
-
-
--- =====================================================================
--- BAGIAN 6. CARA MEMBANGKITKAN 243 ATURAN
---           Jangan ditulis tangan satu per satu.
--- =====================================================================
--- 3 himpunan x 4 gejala x 3 tingkat paparan = 3^5 = 243.
 --
--- Buat SATU query INSERT ... SELECT dengan CROSS JOIN antara keempat
--- himpunan gejala dan ketiga tingkat paparan. Kesimpulan tiap baris
--- ditentukan dua langkah:
+--  (2) variabel                                     5 baris data awal
+--      ----------------------------------------------------------------
+--      Daftar pertanyaan gejala dan satu keluaran.
 --
---   Langkah 1: jumlahkan bobot keempat gejala (hasilnya 0 sampai 10),
---              lalu tentukan kekuatan gejalanya:
---                  0-2  = rendah
---                  3-5  = sedang
---                  6-10 = tinggi
+--      id, kode (unik: HAID, MUAL, NYERI, BAK, HASIL), nama, satuan,
+--      nilai_min, nilai_maks,          <- dipakai memvalidasi jawaban
+--      jenis ENUM('input','output'), urutan
 --
---   Langkah 2: ambil kesimpulan dari matriks ini
 --
---     kekuatan \ paparan | rendah | sedang | tinggi
---     -------------------+--------+--------+-------
---     rendah             | RENDAH | RENDAH | SEDANG
---     sedang             | RENDAH | SEDANG | TINGGI
---     tinggi             | SEDANG | TINGGI | TINGGI
+--  (3) himpunan                                    15 baris data awal
+--      ----------------------------------------------------------------
+--      Batas tiap tingkatan. Tabel ini memakai kolom berbeda tergantung
+--      jenis variabelnya, jadi perhatikan baik-baik.
 --
--- Matriks ini monoton: menaikkan paparan atau kekuatan gejala tidak pernah
--- menurunkan kesimpulan.
+--      id, variabel_id -> variabel.id, kode, nama,
+--      bentuk ENUM('trapesium','naik','turun'),
+--      a, b, c, d            <- untuk 12 tingkatan gejala (trapesium)
+--      batas_bawah, batas_atas  <- untuk 3 tingkatan keluaran (monoton)
+--      bobot                 <- untuk 12 tingkatan gejala, lihat Bagian 6
+--      urutan
 --
--- Simpan juga kolom bobot_gejala dan kekuatan_gejala di tabel aturan supaya
--- sifat monoton itu bisa diperiksa dengan query.
+--      Kode unik per variabel, sehingga MUAL.SEDANG dan NYERI.SEDANG boleh
+--      sama-sama bernama SEDANG.
 --
--- Beri tiap aturan satu kolom kode yang enak dibaca manusia, berisi gabungan
--- kelima kode syaratnya, contoh: AGAK_TELAT-SEDANG-BERAT-MENINGKAT-SEDANG
-
-
--- =====================================================================
--- BAGIAN 7. HASIL YANG BENAR, UNTUK MEMERIKSA PEKERJAANMU
--- =====================================================================
--- Setelah semua query di atas dijalankan, angka-angka ini harus keluar.
--- Kalau tidak sama, ada yang salah pada pembobotan atau rumus baliknya.
 --
---   SELECT COUNT(*) FROM aturan;                   -- harus 243
---   sebaran kesimpulan                             -- RENDAH 58, SEDANG 81, TINGGI 104
---   sebaran kekuatan gejala (per pola, bagi 3)     -- rendah 11, sedang 36, tinggi 34
---   bobot_gejala tertinggi                         -- 10
+--  (4) rules                                      162 baris, dibangkitkan
+--      ----------------------------------------------------------------
+--      Daftar aturan yang mencocokkan jawaban pengguna dengan kategori.
+--      Lima syarat dibuat sejajar dalam satu baris supaya mudah dibaca.
 --
--- Contoh kasus yang harus bisa direproduksi:
---   Jawaban : telat haid 18 hari, mual 6 kali/hari, nyeri payudara 7,
---             berkemih 11 kali/hari, hubungan terakhir 20 hari lalu,
---             selalu pakai pengaman, ejakulasi di dalam.
---   Paparan : sedang. Gerbang 7 hari lolos.
---   Derajat : AGAK_TELAT 1,0 | MUAL SEDANG 0,5 | MUAL BERAT 0,5
---             NYERI SEDANG 0,5 | NYERI BERAT 0,5 | BAK MENINGKAT 1,0
---   Aktif   : 4 aturan, semuanya alfa = 0,5
---               1 aturan berkesimpulan SEDANG  -> z = 30 + 40*0,5 = 50
---               3 aturan berkesimpulan TINGGI  -> z = 60 + 40*0,5 = 80
---   Skor    : (0,5*50 + 0,5*80 + 0,5*80 + 0,5*80) / 2 = 145 / 2 = 72,5
---             dibulatkan 73, kategori tinggi
+--      id, kode (unik, gabungan kelima syarat),
+--      himpunan_haid_id   -> himpunan.id
+--      himpunan_mual_id   -> himpunan.id
+--      himpunan_nyeri_id  -> himpunan.id
+--      himpunan_bak_id    -> himpunan.id
+--      pakai_pengaman ENUM('ya','tidak')      <- syarat kelima
+--      himpunan_hasil_id  -> himpunan.id      <- kesimpulan
+--      bobot_gejala, kekuatan_gejala          <- lihat Bagian 6
 --
--- Uji batas:
---   tanpa gejala sama sekali + paparan rendah  -> skor 0
---   semua gejala berat + paparan tinggi        -> skor 100
-
-
--- =====================================================================
--- BAGIAN 8. YANG HARUS ADA DI JAWABANMU
--- =====================================================================
--- 1. Delapan CREATE TABLE, urut dari tabel yang tidak bergantung ke tabel
---    lain. Sertakan primary key, foreign key, index, UNIQUE, komentar
---    berbahasa Indonesia satu baris di setiap tabel, dan DECIMAL untuk
---    semua nilai berkoma (jangan FLOAT).
--- 2. CHECK constraint minimal untuk: baris berstatus bukan 'selesai' wajib
---    kosong skornya, nilai alfa antara 0 dan 1, dan titik trapesium urut
---    a <= b <= c <= d.
--- 3. INSERT data awal sesuai Bagian 5.
--- 4. Satu query pembangkit 243 aturan sesuai Bagian 6.
--- 5. Satu INSERT contoh penilaian sesuai Bagian 7, lengkap dengan baris
---    penilaian_aturan-nya, supaya angka 72,5 bisa langsung diuji.
--- 6. Tiga view:
---      - menampilkan 243 aturan sebagai kalimat JIKA ... MAKA ...
---      - menghitung ulang skor: SUM(alfa*z)/SUM(alfa)
---      - menghitung ulang z dari alfa memakai batas himpunan keluaran
--- 7. Daftar singkat tiap tabel: namanya dan satu baris penjelasan dengan
---    bahasa yang mudah dimengerti orang awam.
+--      WAJIB: buat UNIQUE gabungan pada kelima kolom syarat, supaya aturan
+--      kembar atau yang saling bertentangan tidak bisa masuk dua kali.
 --
--- Kalau ada bagian yang menurutmu rancangannya kurang tepat, katakan dan
--- beri usulanmu, tapi tetap buatkan skema lengkapnya.
+--
+--  (5) penilaian                        bertambah tiap pengisian kuesioner
+--      ----------------------------------------------------------------
+--      Semua jawaban pengguna disimpan di sini bersama hasilnya, dan tiap
+--      baris menyimpan id usernya.
+--
+--      id, user_id -> users.id, diisi_pada,
+--
+--      -- jawaban riwayat (Bagian 2A)
+--      pernah_hubungan ENUM('ya','tidak'),
+--      jarak_hubungan_hari          <- angka, kosong bila pernah = tidak
+--      pakai_pengaman ENUM('ya','tidak'),  <- kosong bila pernah = tidak
+--
+--      -- jawaban gejala (Bagian 2B)
+--      telat_haid, mual, nyeri_payudara, berkemih,
+--
+--      -- hasil pemeriksaan dua keadaan di Bagian 2C
+--      status ENUM('selesai','belum_bisa_dinilai','tanpa_riwayat_hubungan'),
+--      tanggal_uji_awal             <- hanya saat belum_bisa_dinilai
+--
+--      -- hasil perhitungan, kosong bila status bukan 'selesai'
+--      skor_mentah                  <- sebelum dibulatkan, mis. 72.5000
+--      skor                         <- sesudah dibulatkan, mis. 73
+--      kategori ENUM('rendah','sedang','tinggi'),
+--      jumlah_rules_aktif
+--
+--
+--  (6) penilaian_rules                           jejak perhitungan
+--      ----------------------------------------------------------------
+--      Satu baris untuk setiap aturan yang terpakai pada satu penilaian.
+--      Jumlahnya berbeda tiap penilaian, jadi harus berupa baris, tidak
+--      boleh dijadikan kolom di tabel penilaian.
+--
+--      penilaian_id -> penilaian.id  (ON DELETE CASCADE)
+--      rule_id      -> rules.id
+--      alfa         <- kekuatan aturan, 0 sampai 1
+--      z            <- angka hasil rumus balik, lihat Bagian 4
+--      Kunci utama: gabungan penilaian_id dan rule_id.
+--
+--
+--  (7) kategori_hasil                              5 baris data awal
+--      ----------------------------------------------------------------
+--      Semua teks yang dibaca pengguna, termasuk dua keadaan tanpa skor.
+--
+--      id, kode ENUM('rendah','sedang','tinggi',
+--                    'belum_bisa_dinilai','tanpa_riwayat_hubungan'),
+--      skor_min, skor_maks       <- kosong untuk dua kode terakhir
+--      judul, saran, peringatan
+--
+--
+--  Tidak perlu tabel versi pengetahuan, catatan perubahan, atau evaluasi
+--  akurasi. Cukup tujuh tabel di atas.
 
 
 -- =====================================================================
--- TODO: tulis skemanya mulai dari sini
+--  BAGIAN 4 - CARA MENGHITUNG DENGAN TSUKAMOTO
+--             Bagian ini paling sering tertukar dengan Mamdani.
 -- =====================================================================
+--
+--  Lima langkah:
+--
+--  1. FUZZIFIKASI
+--     Tiap jawaban gejala diubah menjadi angka kecocokan 0 sampai 1
+--     terhadap setiap tingkatan, memakai titik trapesium a, b, c, d:
+--       nilai 0 sebelum a, naik dari a ke b, penuh dari b ke c,
+--       turun dari c ke d, nilai 0 setelah d.
+--     Satu jawaban boleh cocok dengan dua tingkatan sekaligus, misalnya
+--     setengah "sedang" dan setengah "berat".
+--
+--  2. MEMILIH ATURAN YANG AKTIF
+--     Sebuah aturan aktif bila semua tingkatan pada syaratnya punya
+--     kecocokan di atas 0, dan kolom pakai_pengaman-nya sama dengan
+--     jawaban pengguna. Jawaban pengaman bersifat tegas, kecocokannya 1.
+--
+--  3. KEKUATAN ATURAN
+--     alfa = nilai TERKECIL di antara kelima syarat (operator AND = MIN).
+--     Satu syarat yang lemah sudah cukup melemahkan seluruh aturan.
+--
+--  4. RUMUS BALIK  <= INILAH YANG KHAS TSUKAMOTO
+--     Setiap aturan menghasilkan satu angka z sendiri, dihitung dari
+--     alfa-nya dengan membalik rumus tingkatan keluaran:
+--
+--        bentuk 'naik'  ->  z = batas_bawah + (batas_atas - batas_bawah) * alfa
+--        bentuk 'turun' ->  z = batas_atas  - (batas_atas - batas_bawah) * alfa
+--
+--     TIDAK ADA tahap penggabungan atau pencarian titik tengah seperti
+--     pada Mamdani. Tiap aturan langsung menjadi satu angka.
+--
+--  5. RATA-RATA TERBOBOT
+--     skor = jumlah(alfa * z) dibagi jumlah(alfa)
+--     lalu dibulatkan setengah ke atas, sehingga 72,5 menjadi 73.
+--
+--
+--  SYARAT TINGKATAN KELUARAN HARUS MONOTON
+--
+--  Karena z dicari dengan membalik rumus, tingkatan keluaran hanya boleh
+--  naik terus atau turun terus. Bentuk segitiga tidak boleh dipakai di
+--  sini, karena satu alfa akan memberi dua kemungkinan jawaban. Pakai
+--  tiga tingkatan keluaran ini:
+--
+--     kode     bentuk   batas_bawah  batas_atas   rumus balik
+--     -------  -------  -----------  ----------   -------------------
+--     RENDAH   turun          0           40      z = 40 - 40 * alfa
+--     SEDANG   naik          30           70      z = 30 + 40 * alfa
+--     TINGGI   naik          60          100      z = 60 + 40 * alfa
+--
+--
+--  KENAPA z HARUS DISIMPAN DI DATABASE
+--
+--  Nilai z tidak tetap. Dia dihitung dari alfa, dan alfa berbeda tiap
+--  pengguna, sehingga aturan yang sama bisa memberi z = 80 untuk satu
+--  orang dan z = 65 untuk orang lain. Kalau z tidak disimpan di tabel
+--  penilaian_rules, hasil lama tidak bisa diperiksa ulang, dan begitu
+--  admin menggeser batas tingkatan keluaran, seluruh riwayat lama akan
+--  terbaca salah.
 
--- SET NAMES utf8mb4;
 
--- CREATE TABLE pengguna ( ... );
--- CREATE TABLE variabel ( ... );
--- CREATE TABLE himpunan ( ... );
--- CREATE TABLE paparan ( ... );
--- CREATE TABLE aturan ( ... );
--- CREATE TABLE kategori_hasil ( ... );
--- CREATE TABLE penilaian ( ... );
--- CREATE TABLE penilaian_aturan ( ... );
+-- =====================================================================
+--  BAGIAN 5 - DATA AWAL YANG HARUS IKUT DIMASUKKAN
+-- =====================================================================
+--
+--  Tingkatan gejala, dengan titik trapesium [a, b, c, d] dan bobotnya.
+--  Bobot hanya dipakai sekali untuk menyusun aturan di Bagian 6, dan
+--  TIDAK dipakai saat menghitung skor.
+--
+--    TELAT HAID (hari, 0-60)
+--      TEPAT_WAKTU  [ 0,  0,  5, 12]   bobot 0
+--      AGAK_TELAT   [ 7, 14, 21, 28]   bobot 2
+--      TELAT        [21, 35, 60, 60]   bobot 4
+--
+--    MUAL DAN MUNTAH (kali per hari, 0-10)
+--      RINGAN       [ 0,  0,  1,  3]   bobot 0
+--      SEDANG       [ 2,  4,  5,  7]   bobot 1
+--      BERAT        [ 5,  7, 10, 10]   bobot 2
+--
+--    NYERI PAYUDARA (skala 0-10)
+--      RINGAN       [ 0,  0,  2,  5]   bobot 0
+--      SEDANG       [ 3,  5,  6,  8]   bobot 1
+--      BERAT        [ 6,  8, 10, 10]   bobot 2
+--
+--    FREKUENSI BERKEMIH (kali per hari, 4-20)
+--      NORMAL       [ 4,  4,  6,  9]   bobot 0
+--      MENINGKAT    [ 7, 10, 12, 15]   bobot 1
+--      SERING       [12, 15, 20, 20]   bobot 2
+--
+--  Telat haid diberi bobot ganda (0, 2, 4) sedangkan gejala lain 0, 1, 2,
+--  karena telat haid satu-satunya gejala yang bisa berdiri sendiri sebagai
+--  indikasi kehamilan.
+--
+--  Tingkatan keluaran: tiga baris sesuai tabel di Bagian 4.
+--
+--  Ambang kategori dan teks sarannya:
+--      rendah   skor  0 - 39    "Indikasi lemah"
+--      sedang   skor 40 - 70    "Indikasi meragukan"
+--      tinggi   skor 71 - 100   "Indikasi kuat"
+--      belum_bisa_dinilai       tanpa ambang
+--      tanpa_riwayat_hubungan   tanpa ambang
+--  Isi kolom saran dengan saran tindak lanjut yang masuk akal, dan kolom
+--  peringatan dengan kalimat bahwa hasil ini bukan diagnosis.
+--
+--  Dua akun awal: satu admin dan satu user contoh.
+
+
+-- =====================================================================
+--  BAGIAN 6 - CARA MEMBANGKITKAN 162 ATURAN
+--             Jangan ditulis tangan satu per satu.
+-- =====================================================================
+--
+--  Jumlahnya: 3 tingkatan x 4 gejala x 2 jawaban pengaman = 3^4 x 2 = 162.
+--
+--  Buat SATU query INSERT ... SELECT dengan CROSS JOIN antara keempat
+--  tingkatan gejala dan kedua jawaban pengaman. Kesimpulan tiap baris
+--  ditentukan dua langkah.
+--
+--  Langkah 1: jumlahkan bobot keempat tingkatan gejala. Hasilnya 0 sampai
+--             10. Dari jumlah itu tentukan kekuatan gejalanya:
+--
+--                 0 - 2   ->  rendah
+--                 3 - 5   ->  sedang
+--                 6 - 10  ->  tinggi
+--
+--  Langkah 2: ambil kesimpulan dari matriks berikut.
+--
+--      kekuatan gejala | pakai pengaman | tidak pakai pengaman
+--      ----------------+----------------+---------------------
+--      rendah          |     RENDAH     |     RENDAH
+--      sedang          |     SEDANG     |     TINGGI
+--      tinggi          |     TINGGI     |     TINGGI
+--
+--  Perhatikan kolom "pakai pengaman" tidak pernah berisi RENDAH untuk
+--  gejala sedang atau tinggi. Ini disengaja: kontrasepsi punya angka
+--  kegagalan, jadi jawaban "pakai pengaman" tidak boleh dipakai untuk
+--  menihilkan skor seseorang yang gejalanya kuat.
+--
+--  Matriks ini monoton: menaikkan kekuatan gejala atau menghilangkan
+--  pengaman tidak pernah menurunkan kesimpulan.
+--
+--  Simpan juga kolom bobot_gejala dan kekuatan_gejala di tabel rules,
+--  supaya sifat monoton itu bisa diperiksa dengan satu query tanpa
+--  menghitung ulang 162 baris.
+--
+--  Beri tiap aturan satu kolom kode yang enak dibaca manusia, berisi
+--  gabungan kelima syaratnya, contoh:
+--      AGAK_TELAT-SEDANG-BERAT-MENINGKAT-PENGAMAN_YA
+
+
+-- =====================================================================
+--  BAGIAN 7 - ANGKA HASIL YANG BENAR
+--             Pakai ini untuk memeriksa pekerjaanmu sendiri.
+-- =====================================================================
+--
+--  Setelah semua query dijalankan, angka-angka ini harus keluar. Kalau
+--  tidak sama, berarti ada yang salah pada pembobotan, matriks, atau
+--  rumus baliknya.
+--
+--      jumlah baris rules                      162
+--      sebaran kesimpulan   RENDAH  22,  SEDANG  36,  TINGGI 104
+--      sebaran kekuatan gejala per pola
+--                           rendah  11,  sedang  36,  tinggi  34  (= 81)
+--      bobot_gejala tertinggi                   10
+--
+--
+--  CONTOH KASUS YANG HARUS BISA DIREPRODUKSI
+--
+--  Jawaban pengguna:
+--      pernah berhubungan      : ya
+--      jarak hubungan terakhir : 20 hari
+--      pakai pengaman          : ya
+--      telat haid              : 18 hari
+--      mual                    : 6 kali per hari
+--      nyeri payudara          : 7
+--      berkemih                : 11 kali per hari
+--
+--  Pemeriksaan keadaan : pernah = ya, dan 20 >= 7, jadi status 'selesai'.
+--
+--  Fuzzifikasi:
+--      telat haid 18  ->  AGAK_TELAT    1,0
+--      mual 6         ->  SEDANG 0,5  dan  BERAT 0,5
+--      nyeri 7        ->  SEDANG 0,5  dan  BERAT 0,5
+--      berkemih 11    ->  MENINGKAT     1,0
+--
+--  Aturan aktif: 4 buah, semuanya alfa = 0,5 karena nilai terkecil di
+--  antara kelima syaratnya adalah 0,5.
+--      1 aturan berkesimpulan SEDANG  ->  z = 30 + 40 * 0,5 = 50
+--      3 aturan berkesimpulan TINGGI  ->  z = 60 + 40 * 0,5 = 80
+--
+--  Skor:
+--      (0,5*50 + 0,5*80 + 0,5*80 + 0,5*80) / (0,5+0,5+0,5+0,5)
+--      = 145 / 2
+--      = 72,5   ->  dibulatkan 73  ->  kategori tinggi
+--
+--
+--  UJI PEMBANDING, dengan jawaban gejala yang sama persis
+--
+--      pakai pengaman = tidak   ->  keempat aturan jadi TINGGI,
+--                                   semua z = 80, skor = 80
+--
+--  Jadi menjawab "pakai pengaman" menurunkan skor dari 80 ke 73, tapi
+--  tidak sampai memindahkannya ke kategori yang lebih rendah. Itu memang
+--  perilaku yang diinginkan.
+--
+--
+--  UJI BATAS
+--
+--      tanpa gejala sama sekali, pakai pengaman   ->  skor   0  (rendah)
+--      semua gejala berat, tanpa pengaman         ->  skor 100  (tinggi)
+
+
+-- =====================================================================
+--  BAGIAN 8 - PERINTAH DAN BENTUK JAWABAN
+-- =====================================================================
+--
+--  Tolong buatkan skema database lengkap sesuai keterangan di atas, dalam
+--  satu file SQL yang bisa langsung dijalankan, berisi:
+--
+--   1. Tujuh CREATE TABLE, diurutkan dari tabel yang tidak bergantung pada
+--      tabel lain. Sertakan primary key, foreign key, index untuk kolom
+--      yang sering dicari, dan UNIQUE untuk data yang tidak boleh kembar.
+--      Pakai InnoDB dan utf8mb4. Pakai DECIMAL untuk semua nilai berkoma,
+--      jangan FLOAT. Beri komentar berbahasa Indonesia satu baris pada
+--      setiap tabel.
+--
+--   2. CHECK constraint, minimal untuk:
+--        - baris dengan status bukan 'selesai' wajib kosong skor dan
+--          kategorinya, dan sebaliknya
+--        - nilai alfa harus lebih dari 0 dan maksimal 1
+--        - titik trapesium harus urut, a <= b <= c <= d
+--
+--   3. INSERT data awal sesuai Bagian 5.
+--
+--   4. Satu query pembangkit 162 aturan sesuai Bagian 6.
+--
+--   5. Satu INSERT contoh penilaian sesuai Bagian 7, lengkap dengan baris
+--      penilaian_rules-nya, sehingga angka 72,5 bisa langsung diuji.
+--
+--   6. Tiga view:
+--        - menampilkan seluruh aturan sebagai kalimat JIKA ... MAKA ...
+--        - menghitung ulang skor dari jejak: SUM(alfa*z) / SUM(alfa)
+--        - menghitung ulang z dari alfa memakai batas tingkatan keluaran
+--
+--   7. Daftar singkat ketujuh tabel: nama dan satu baris penjelasan,
+--      ditulis dengan bahasa yang mudah dimengerti orang awam.
+--
+--   8. Gambaran hubungan antar tabel, dalam bentuk daftar. Contoh:
+--      "satu penilaian punya banyak penilaian_rules".
+--
+--  Kalau ada bagian yang menurutmu rancangannya kurang tepat, katakan dan
+--  beri usulanmu, tapi tetap buatkan skema lengkapnya.
